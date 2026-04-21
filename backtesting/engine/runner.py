@@ -53,6 +53,7 @@ def _simulate(
     hard_stop_pct: float = 0.0,
     opens: pd.Series | None = None,
     lows: pd.Series | None = None,
+    entry_stops: pd.Series | None = None,
 ) -> PortfolioStats:
     """Vectorized single-asset portfolio simulation.
 
@@ -67,6 +68,7 @@ def _simulate(
     in_position = False
     entry_price = 0.0
     entry_date = None
+    active_stop_price = float("nan")
     trades: list[TradeRecord] = []
     last_month: int | None = None
 
@@ -99,16 +101,21 @@ def _simulate(
             in_position = True
             entry_price = fill
             entry_date = date
+            # Per-entry stop: from entry_stops series, else uniform hard_stop_pct
+            if entry_stops is not None and not pd.isna(entry_stops.get(date, float("nan"))):
+                active_stop_price = entry_stops.get(date)
+            elif hard_stop_pct > 0:
+                active_stop_price = fill * (1 - hard_stop_pct)
+            else:
+                active_stop_price = float("nan")
 
-        elif in_position and hard_stop_pct > 0 and (
-            lows is not None and lows.get(date, price) < entry_price * (1 - hard_stop_pct)
-            or lows is None and price < entry_price * (1 - hard_stop_pct)
+        elif in_position and not pd.isna(active_stop_price) and (
+            lows is not None and lows.get(date, price) < active_stop_price
+            or lows is None and price < active_stop_price
         ):
-            stop_price = entry_price * (1 - hard_stop_pct)
+            stop_price = active_stop_price
             if opens is not None:
                 open_price = opens.get(date, price)
-                # Gap-down: opened below stop — fill at open (can't do better)
-                # Intraday hit: opened above stop — fill at stop price
                 fill_price = open_price if open_price < stop_price else stop_price
             else:
                 fill_price = price
@@ -131,6 +138,7 @@ def _simulate(
             cash = proceeds
             shares = 0.0
             in_position = False
+            active_stop_price = float("nan")
 
         elif in_position and exits.get(date, False):
             proceeds = shares * fill * (1 - fees)
@@ -151,6 +159,7 @@ def _simulate(
             cash = proceeds
             shares = 0.0
             in_position = False
+            active_stop_price = float("nan")
 
         equity.append(cash + shares * price)
 
@@ -392,7 +401,9 @@ class BacktestRunner:
 
         strategy_cls = get_strategy(params.strategy_name)
         strategy = strategy_cls(params.strategy_params)
-        entries, exits = strategy.generate_signals(data)
+        sig = strategy.generate_signals(data)
+        entries, exits = sig[0], sig[1]
+        entry_stops = sig[2] if len(sig) > 2 else None
         opens = data.df["Open"] if "Open" in data.df.columns else None
         lows = data.df["Low"] if "Low" in data.df.columns else None
 
@@ -422,6 +433,7 @@ class BacktestRunner:
                 hard_stop_pct=getattr(strategy, "hard_stop_pct", 0.0),
                 opens=opens,
                 lows=lows,
+                entry_stops=entry_stops,
             )
 
         benchmark_stats = None

@@ -94,7 +94,7 @@ Opens at `http://localhost:8501`. Configure symbol, strategy, date range, and ca
 
 | Name | Type | Description |
 |---|---|---|
-| `ha_sma` | All-in | **Preferred.** Heikin-Ashi reversal with hard stop and downtrend pause |
+| `ha_sma` | All-in | **Preferred.** Heikin-Ashi reversal + SMA9 golden cross with adaptive stops |
 | `ha_sma_dca` | % DCA | Heikin-Ashi DCA — adds on each red→green flip below SMA |
 | `renko_sma` | All-in | Renko ATR reversal with SMA crossunder exit |
 | `renko_sma_dca` | DCA | Renko reversal with equal-lot DCA adds |
@@ -107,47 +107,72 @@ Opens at `http://localhost:8501`. Configure symbol, strategy, date range, and ca
 
 ### Concept
 
-Heikin-Ashi bars smooth price action by averaging OHLC values, making trend reversals easier to spot. This strategy buys when price is in a corrective pullback below the slow SMA and HA bars flip from red to green — a momentum reversal signal. It exits via a macro trend filter (SMA death cross) or a hard stop to cap losses.
+Two complementary entry signals with adaptive risk management:
 
-### Rules
+1. **HA Reversal** — buys when Heikin-Ashi bars flip red→green after a meaningful pullback (≥3% below SMA50). Stop is placed 1% below the lowest low of the preceding red run — the natural support level from the correction. Exit only on the SMA21/SMA100 death cross.
 
-**Entry** — all must be true on the same bar:
-- Heikin-Ashi bar color flips red → green
-- HA close is below SMA(21)
+2. **Golden Cross re-entry** — when SMA9 crosses above SMA50 (momentum recovery confirmed), re-enters even if the HA reversal conditions aren't met. Stop is 1% below the entry close price. This catches recovery legs where price never pulled back far enough for the reversal signal but the trend has clearly turned.
 
-**Exit** — first of:
-1. **Hard stop**: actual close price drops ≥ 1% below entry fill price
-2. **Death cross**: SMA(21) crosses below SMA(100) (macro bear signal)
+The idea: if everything goes right, the HA entry rides up to the golden cross and beyond. If not, the stop at the previous red-run low limits the damage.
 
-**Downtrend protection** — consecutive stop pause:
-- After 3 hard stops ≤ 3% loss, sit out 50 bars before taking new entries
-- Extraordinary gap-downs > 3% are excluded from the consecutive counter (they are market-wide events, not trend signals)
+### Entry Rules
+
+**Entry A — HA Reversal (below SMA21):**
+- Heikin-Ashi bars flip red → green (or `confirm_bars` consecutive greens)
+- HA close < SMA21
+- Actual price ≥ `filter_pct`% below SMA50 (default 3%)
+- **Stop**: 1% below the lowest actual Low of the preceding red run
+
+**Entry B — Golden Cross (above SMA21):**
+- SMA9 crosses above SMA50
+- **Stop**: 1% below the entry close price
+
+**Exit (both entries):**
+- SMA21 crosses below SMA100 (death cross — macro bear signal)
+- Or stop is hit (described above per entry type)
 
 ### Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `sma_period` | 21 | Entry filter SMA period |
+| `sma_period` | 21 | SMA period for entry filter and death cross exit |
 | `exit_sma_period` | 100 | Slow SMA for death cross exit |
-| `consec_stop_limit` | 3 | Consecutive stops before pausing |
-| `pause_bars` | 50 | Bars to sit out after hitting limit |
+| `filter_sma_period` | 50 | SMA period for depth filter and golden cross |
+| `filter_pct` | 3.0 | Min % price must be below SMA50 to enter (reversal) |
+| `fast_sma_period` | 9 | Fast SMA for golden cross re-entry |
+| `confirm_bars` | 1 | Green HA bars required before entry (1=first flip, 2=second) |
+| `above_sma_stop_pct` | 1.0 | Hard stop % for both entry types |
 
-### Backtest Results (SPY)
+### Backtest Results (SPY, 2020–2025)
 
-| Period | Strategy Return | B&H Return | Notes |
-|---|---|---|---|
-| 2020–2023 | ~115% | ~56% | COVID crash recovery, 2022 bear, 2023 rebound |
-| 2024–2025 | Open position +31%+ | — | Entered April 22, 2025 after tariff crash bottom |
+| Metric | Strategy | Buy & Hold |
+|---|---|---|
+| Total Return | ~88% | ~71% |
+| CAGR | ~12.7% | ~10.7% |
+| Sharpe | 0.77 | 0.58 |
+| Max Drawdown | -25.8% | -33.7% |
+| Trades | 13 | 1 |
+| Avg Hold | 139 days | — |
 
-Key characteristics (2020–2023):
-- 12 total trades, avg holding period ~103 days
-- Long winners, short losers (1% hard stop)
-- Sat out most of 2022 bear market via consecutive stop pause
+Key trades:
+- **2020-03-24 → 2022-02-03**: +88.49% (629 days) — COVID crash bottom, rode full recovery
+- **2022-10-14 → 2023-10-05**: +20.57% — 2022 bear market bottom
+- **2023-10-31 → 2025-03-12**: +35.90% (498 days) — entire 2024 bull run
 
 ### Usage
 
 ```bash
-bt run --symbol SPY --strategy ha_sma --start 2020-01-01 --end 2024-01-01 --trades
+# Default run
+bt run --symbol SPY --strategy ha_sma --start 2020-01-01 --end 2025-01-01 --trades
+
+# Wait for second confirmed green bar before entry
+bt run --symbol SPY --strategy ha_sma --trades --confirm-bars 2
+
+# Custom filter depth
+bt run --symbol SPY --strategy ha_sma --trades --filter-pct 5
+
+# Idle cash earns 4% annualized (default) — change with:
+bt run --symbol SPY --strategy ha_sma --cash-rate 0.05
 ```
 
 ---
@@ -156,29 +181,29 @@ bt run --symbol SPY --strategy ha_sma --start 2020-01-01 --end 2024-01-01 --trad
 
 ### What works
 
-**Heikin-Ashi for reversals** — HA bars filter noise better than raw candles for identifying red→green flips at pullback lows. The smoothing effect means entries happen slightly after the actual bottom, but with higher confidence.
+**Heikin-Ashi for reversals** — HA bars smooth noise, making red→green flips at pullback lows more reliable than raw candles. Smoothing means entries fire slightly after the exact bottom, but with higher signal quality.
 
-**Below-SMA-only entries** — filtering to only take entries when price is below SMA(21) avoids chasing breakouts and keeps the strategy focused on pullback reversals.
+**SMA50 depth filter (3%)** — requiring price to be 3%+ below SMA50 filters shallow dead-cat bounces (2022 churn) while allowing meaningful crash reversals (2020 COVID). Without this, the strategy takes 13+ losses in 2022 on 1-3 bar fake bounces.
 
-**Hard stop over trailing stop** — a fixed 1% hard stop on the actual close price (not HA price) cleanly caps loss per trade. HA smoothing would cause late stops; actual price is used instead.
+**SMA9 golden cross re-entry** — catches recovery legs where price never pulls back far enough for the HA reversal signal. Enables re-entries after death-cross exits without waiting for a deep pullback.
 
-**Death cross as macro exit** — SMA(21) crossing below SMA(100) is a slow, lagging signal — which is exactly what's wanted for exits. It avoids whipsawing out of multi-month winners during normal pullbacks while catching genuine bear markets.
+**Red-run low as stop level** — using the lowest Low of the preceding red run as the stop anchor is the natural support from the correction. If price revisits those lows, the thesis is invalidated.
 
-**Consecutive stop pause** — taking 11 consecutive 1% losses in 2022 was the biggest drawdown risk. A 50-bar sit-out after 3 consecutive stops lets the trend fully resolve before re-engaging. This alone separated the 2022 experience from being crippling.
+**Death cross as macro exit** — SMA21 crossing below SMA100 is slow and lagging — which is exactly right for exits. Avoids whipsawing out of multi-month winners during normal pullbacks while catching genuine bear markets.
+
+**4% cash rate on idle periods** — idle cash earns interest (HYSA/T-bill proxy), adding return during out-of-market periods. Shown explicitly in the `--trades` table.
 
 ### What doesn't work
 
-**Dead zone filter on entry** — applying a ±2% SMA buffer to entries blocks too many valid pullback reversals that are inherently near the SMA line. Removed.
+**Fixed 1% stop on close price** — too tight for daily bar resolution. A -5% tariff gap-down fires the stop at the open, not at 1%. Using Low/Open for stop detection significantly improves fill accuracy.
 
-**SMA slope filter** — requiring SMA(50) to be rising to allow entries blocked the March 2020 COVID crash recovery (slope was still falling when the bottom formed). Rejected.
+**Consecutive stop pause mechanism** — counting stops to trigger a sit-out period is too deterministic and blocks genuine recovery entries (e.g., April 9/22, 2025 after the tariff crash). Removed in favor of the SMA50 depth filter.
 
-**HA-based stop prices** — computing stop prices from HA low values introduces lag. The strategy uses actual close vs entry fill for stop checks instead.
-
-**Tight consecutive stop threshold** — a 2% gap exclusion cut into 2022 stops that should count, reducing 2020–2023 return. 3% threshold correctly excludes only extraordinary single-session gap events (e.g., tariff announcements).
+**SMA slope filter** — requiring SMA50 to be rising blocks crash recovery entries (SMA50 still falling when the bottom forms). Rejected.
 
 ### Gap risk (inherent limitation)
 
-On daily bars, overnight gaps can cause fills significantly below the 1% stop level. A -4.93% tariff-related gap-down in April 2025 filled at -4.93% despite a 1% stop. This is accepted as a property of daily-resolution backtesting — the stop triggers at the open if price gaps below it, not at the stop price.
+On daily bars, overnight gaps cause fills at the open rather than the stop price. A gap-down through the stop fills at open — still better than close (which is further away), but unavoidable on daily resolution. The stop simulation uses Low to detect trigger and Open to determine fill price.
 
 ---
 
