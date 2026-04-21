@@ -12,7 +12,7 @@ class HASMA(BaseStrategy):
     """
     Heikin-Ashi reversal strategy.
     Entry A: HA red→green flip, HA close < SMA21, price >= filter_pct% below SMA50 → no stop.
-    Entry B: SMA9 golden cross above SMA50 → 1% hard stop (above_sma_stop_pct).
+    Entry B: price > SMA21*1.02 AND price > SMA50 (first bar) → 1% hard stop.
     Exit:    SMA21 crosses below SMA100 (death cross) OR SMA9 crosses below SMA21
              when SMA21 <= SMA200 * (1 + exit_guard_pct).
     """
@@ -57,6 +57,7 @@ class HASMA(BaseStrategy):
         exit_sma = _ha_sma(ha["close"], exit_sma_period)
         sma50 = df["Close"].rolling(filter_sma_period, min_periods=1).mean()
         sma9 = df["Close"].rolling(fast_sma_period, min_periods=1).mean()
+        sma200 = df["Close"].rolling(sma200_period, min_periods=1).mean()
         actual_sma21 = df["Close"].rolling(sma_period, min_periods=1).mean()
 
         color = ha["color"]
@@ -66,10 +67,11 @@ class HASMA(BaseStrategy):
         reversal = (green_streak == "green").all(axis=1) & (color.shift(confirm_bars) == "red")
         ha_entry = reversal & (ha["close"] < sma21) & (df["Close"] < sma50 * (1 - filter_pct))
 
-        # Entry B: SMA9 crosses above SMA50 (momentum recovery re-entry)
-        golden_cross = (sma9 > sma50) & (sma9.shift(1) <= sma50.shift(1))
+        # Entry B: price recovers above SMA21 by 2%+ AND above SMA50
+        price_recovery = (df["Close"] > actual_sma21 * 1.02) & (df["Close"] > sma50) & \
+                         ~((df["Close"].shift(1) > actual_sma21.shift(1) * 1.02) & (df["Close"].shift(1) > sma50.shift(1)))
 
-        entries = ha_entry | golden_cross
+        entries = ha_entry | price_recovery
 
         # Per-entry stop prices
         entry_stop_prices = pd.Series(float("nan"), index=df.index)
@@ -90,16 +92,14 @@ class HASMA(BaseStrategy):
             ha_stop = red_run_low * (1 - above_sma_stop_pct)
             entry_stop_prices[ha_entry] = ha_stop[ha_entry]
 
-            # Golden cross entries where price > SMA21: stop = 1% below close at entry
-            needs_stop = golden_cross & (df["Close"] > actual_sma21)
-            entry_stop_prices[needs_stop] = df["Close"][needs_stop] * (1 - above_sma_stop_pct)
+            # Entry B (price recovery): stop = 1% below close at entry
+            entry_stop_prices[price_recovery] = df["Close"][price_recovery] * (1 - above_sma_stop_pct)
 
         # Exit: SMA21 crosses below SMA100 (death cross)
         exits = (sma21 < exit_sma) & (sma21.shift(1) >= exit_sma.shift(1))
 
         # Optional: SMA9 crosses below SMA21 or SMA200, guarded — only fires when SMA21 <= SMA200 * (1 + exit_guard_pct)
         if sma9_cross_exit:
-            sma200 = df["Close"].rolling(sma200_period, min_periods=1).mean()
             guard = actual_sma21 <= sma200 * (1 + exit_guard_pct)
             sma9_cross_down_sma21 = (sma9 < actual_sma21) & (sma9.shift(1) >= actual_sma21.shift(1))
             sma9_cross_down_sma200 = (sma9 < sma200) & (sma9.shift(1) >= sma200.shift(1))
