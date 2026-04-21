@@ -20,11 +20,16 @@ class ResultExporter:
             "strategy_metrics": strat_metrics,
             "benchmark_metrics": bench_metrics,
             "trades": [asdict(t) for t in result.strategy.trades],
-            "equity": result.strategy.equity.to_dict(),
+            "equity": {str(k): v for k, v in result.strategy.equity.items()},
         }
+        def _clean(obj):
+            if isinstance(obj, float) and (obj != obj or obj == float("inf") or obj == float("-inf")):
+                return None
+            return str(obj)
+
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
-            json.dump(payload, f, indent=2, default=str)
+            json.dump(payload, f, indent=2, default=_clean)
 
     @staticmethod
     def to_csv(result: BacktestResult, path: str) -> None:

@@ -12,6 +12,8 @@ class BacktestParams(BaseModel):
     strategy_name: str = "sma_crossover"
     strategy_params: dict = {}
     run_benchmark: bool = True
+    cash_rate: float = 0.0  # annual return on idle cash (e.g. 0.025 for 2.5% bonds)
+    annual_contribution: float = 0.0  # cash injected at the start of each calendar year
 
     @model_validator(mode="after")
     def check_dates(self) -> "BacktestParams":

@@ -20,6 +20,8 @@ class StrategyParam:
 class BaseStrategy(ABC):
     name: ClassVar[str]
     description: ClassVar[str]
+    dca_mode: ClassVar[bool] = False
+    hard_stop_pct: ClassVar[float] = 0.0  # hard stop on actual price vs entry fill
 
     def __init__(self, params: dict[str, Any] | None = None):
         self.params = params or {}

@@ -47,8 +47,20 @@ def _simulate(
     init_cash: float,
     fees: float,
     slippage: float,
+    cash_rate: float = 0.0,
+    monthly_contribution: float = 0.0,
+    auto_invest_contributions: bool = True,
+    hard_stop_pct: float = 0.0,
+    consec_stop_limit: int = 0,
+    pause_bars: int = 20,
 ) -> PortfolioStats:
-    """Vectorized single-asset portfolio simulation."""
+    """Vectorized single-asset portfolio simulation.
+
+    auto_invest_contributions=True  (B&H default): contributions immediately buy shares when in position.
+    auto_invest_contributions=False (all-in strategies): contributions accumulate in cash and are
+        fully deployed on the next entry signal.
+    """
+    daily_cash_rate = (1 + cash_rate) ** (1 / 252) - 1
     cash = init_cash
     shares = 0.0
     equity = []
@@ -56,20 +68,68 @@ def _simulate(
     entry_price = 0.0
     entry_date = None
     trades: list[TradeRecord] = []
+    last_month: int | None = None
+    consec_stops = 0
+    pause_remaining = 0
 
     for date, price in prices.items():
+        if monthly_contribution > 0 and hasattr(date, "month"):
+            month_key = (date.year, date.month)
+            if last_month is None:
+                last_month = month_key
+            elif month_key != last_month:
+                last_month = month_key
+                if in_position and auto_invest_contributions and not pd.isna(price):
+                    contrib_fill = price * (1 + slippage)
+                    new_shares = (monthly_contribution / contrib_fill) * (1 - fees)
+                    shares += new_shares
+                else:
+                    cash += monthly_contribution
+
         if pd.isna(price):
             equity.append(cash + shares * (price if not pd.isna(price) else 0))
             continue
 
+        if not in_position and daily_cash_rate:
+            cash *= (1 + daily_cash_rate)
+
+        if pause_remaining > 0:
+            pause_remaining -= 1
+
         fill = price * (1 + slippage)
 
-        if not in_position and entries.get(date, False):
+        if not in_position and pause_remaining == 0 and entries.get(date, False):
             shares = (cash / fill) * (1 - fees)
             cash = 0.0
             in_position = True
             entry_price = fill
             entry_date = date
+
+        elif in_position and hard_stop_pct > 0 and price < entry_price * (1 - hard_stop_pct):
+            fill = price * (1 + slippage)
+            proceeds = shares * fill * (1 - fees)
+            pnl = proceeds - (shares * entry_price)
+            pnl_pct = (fill / entry_price - 1) * 100
+            duration = (date - entry_date).days if hasattr(date - entry_date, "days") else 0
+            trades.append(
+                TradeRecord(
+                    entry_date=str(entry_date.date()) if hasattr(entry_date, "date") else str(entry_date),
+                    exit_date=str(date.date()) if hasattr(date, "date") else str(date),
+                    entry_price=round(entry_price, 4),
+                    exit_price=round(fill, 4),
+                    pnl=round(pnl, 2),
+                    pnl_pct=round(pnl_pct, 2),
+                    duration_days=duration,
+                )
+            )
+            cash = proceeds
+            shares = 0.0
+            in_position = False
+            if consec_stop_limit > 0 and abs(pnl_pct) <= 3.0:
+                consec_stops += 1
+                if consec_stops >= consec_stop_limit:
+                    pause_remaining = pause_bars
+                    consec_stops = 0
 
         elif in_position and exits.get(date, False):
             proceeds = shares * fill * (1 - fees)
@@ -90,8 +150,235 @@ def _simulate(
             cash = proceeds
             shares = 0.0
             in_position = False
+            consec_stops = 0
 
         equity.append(cash + shares * price)
+
+    if in_position and shares > 0:
+        last_date, last_price = list(prices.items())[-1]
+        fill = last_price * (1 + slippage)
+        proceeds = shares * fill * (1 - fees)
+        pnl = proceeds - (shares * entry_price)
+        pnl_pct = (fill / entry_price - 1) * 100
+        duration = (last_date - entry_date).days if hasattr(last_date - entry_date, "days") else 0
+        trades.append(
+            TradeRecord(
+                entry_date=str(entry_date.date()) if hasattr(entry_date, "date") else str(entry_date),
+                exit_date=str(last_date.date()) + " (open)",
+                entry_price=round(entry_price, 4),
+                exit_price=round(fill, 4),
+                pnl=round(pnl, 2),
+                pnl_pct=round(pnl_pct, 2),
+                duration_days=duration,
+            )
+        )
+
+    equity_series = pd.Series(equity, index=prices.index, name="equity")
+    returns = equity_series.pct_change().fillna(0)
+    return PortfolioStats(equity=equity_series, returns=returns, trades=trades, metrics={})
+
+
+def _simulate_dca(
+    prices: pd.Series,
+    entries: pd.Series,
+    exits: pd.Series,
+    init_cash: float,
+    fees: float,
+    slippage: float,
+    max_adds: int,
+    dca_drop_pct: float,
+    cash_rate: float = 0.0,
+) -> PortfolioStats:
+    """DCA portfolio simulation. Each entry signal adds an equal lot if price is
+    >= dca_drop_pct% below the last buy price and lots remain. Full exit on exit signal."""
+    daily_cash_rate = (1 + cash_rate) ** (1 / 252) - 1
+    lot_size = init_cash / max_adds
+    cash = init_cash
+    shares = 0.0
+    total_cost = 0.0
+    lots_used = 0
+    in_position = False
+    last_buy_price = float("inf")
+    entry_date_first = None
+    equity = []
+    trades: list[TradeRecord] = []
+
+    for date, price in prices.items():
+        if pd.isna(price):
+            equity.append(cash + shares * 0)
+            continue
+
+        if not in_position and daily_cash_rate:
+            cash *= (1 + daily_cash_rate)
+
+        fill = price * (1 + slippage)
+
+        if entries.get(date, False):
+            if not in_position:
+                new_shares = (lot_size / fill) * (1 - fees)
+                shares += new_shares
+                cash -= lot_size
+                total_cost += lot_size
+                last_buy_price = fill
+                lots_used = 1
+                in_position = True
+                entry_date_first = date
+
+            elif (
+                lots_used < max_adds
+                and fill <= last_buy_price * (1 - dca_drop_pct / 100)
+                and cash >= lot_size
+            ):
+                new_shares = (lot_size / fill) * (1 - fees)
+                shares += new_shares
+                cash -= lot_size
+                total_cost += lot_size
+                last_buy_price = fill
+                lots_used += 1
+
+        if exits.get(date, False) and in_position:
+            proceeds = shares * fill * (1 - fees)
+            avg_entry = total_cost / shares if shares > 0 else fill
+            pnl = proceeds - total_cost
+            pnl_pct = (proceeds / total_cost - 1) * 100 if total_cost > 0 else 0.0
+            duration = (date - entry_date_first).days if hasattr(date - entry_date_first, "days") else 0
+            trades.append(
+                TradeRecord(
+                    entry_date=str(entry_date_first.date()) if hasattr(entry_date_first, "date") else str(entry_date_first),
+                    exit_date=str(date.date()) if hasattr(date, "date") else str(date),
+                    entry_price=round(avg_entry, 4),
+                    exit_price=round(fill, 4),
+                    pnl=round(pnl, 2),
+                    pnl_pct=round(pnl_pct, 2),
+                    duration_days=duration,
+                )
+            )
+            cash += proceeds
+            shares = 0.0
+            total_cost = 0.0
+            lots_used = 0
+            in_position = False
+            last_buy_price = float("inf")
+
+        equity.append(cash + shares * price)
+
+    equity_series = pd.Series(equity, index=prices.index, name="equity")
+    returns = equity_series.pct_change().fillna(0)
+    return PortfolioStats(equity=equity_series, returns=returns, trades=trades, metrics={})
+
+
+def _simulate_pct_dca(
+    prices: pd.Series,
+    entries: pd.Series,
+    exits: pd.Series,
+    init_cash: float,
+    fees: float,
+    slippage: float,
+    position_pct: float,
+    dca_drop_pct: float,
+    annual_contribution: float = 0.0,
+    cash_rate: float = 0.0,
+) -> PortfolioStats:
+    """
+    Percentage-based DCA simulation.
+    Each entry signal deploys position_pct% of current cash.
+    DCA adds require price to be >= dca_drop_pct% below the last buy price.
+    annual_contribution/12 is added to cash on the first bar of each new month.
+    Idle cash (including partial positions) earns cash_rate at all times.
+    """
+    daily_cash_rate = (1 + cash_rate) ** (1 / 252) - 1
+    monthly_contribution = annual_contribution / 12 if annual_contribution > 0 else 0.0
+    cash = init_cash
+    shares = 0.0
+    total_cost = 0.0
+    in_position = False
+    last_buy_price = float("inf")
+    entry_date_first = None
+    equity: list[float] = []
+    trades: list[TradeRecord] = []
+    last_month: tuple | None = None
+
+    for date, price in prices.items():
+        if monthly_contribution > 0 and hasattr(date, "month"):
+            month_key = (date.year, date.month)
+            if last_month is None:
+                last_month = month_key
+            elif month_key != last_month:
+                last_month = month_key
+                cash += monthly_contribution
+
+        if pd.isna(price):
+            equity.append(cash + shares * 0)
+            continue
+
+        # Cash earns interest at all times (idle cash even while partially in position)
+        if daily_cash_rate and cash > 0:
+            cash *= (1 + daily_cash_rate)
+
+        fill = price * (1 + slippage)
+
+        if entries.get(date, False):
+            if not in_position:
+                buy_amount = cash * position_pct
+                new_shares = (buy_amount / fill) * (1 - fees)
+                shares += new_shares
+                cash -= buy_amount
+                total_cost += buy_amount
+                last_buy_price = fill
+                in_position = True
+                entry_date_first = date
+            elif fill <= last_buy_price * (1 - dca_drop_pct / 100) and cash > 0:
+                buy_amount = cash * position_pct
+                new_shares = (buy_amount / fill) * (1 - fees)
+                shares += new_shares
+                cash -= buy_amount
+                total_cost += buy_amount
+                last_buy_price = fill
+
+        if exits.get(date, False) and in_position:
+            proceeds = shares * fill * (1 - fees)
+            avg_entry = total_cost / shares if shares > 0 else fill
+            pnl = proceeds - total_cost
+            pnl_pct = (proceeds / total_cost - 1) * 100 if total_cost > 0 else 0.0
+            duration = (date - entry_date_first).days if hasattr(date - entry_date_first, "days") else 0
+            trades.append(
+                TradeRecord(
+                    entry_date=str(entry_date_first.date()) if hasattr(entry_date_first, "date") else str(entry_date_first),
+                    exit_date=str(date.date()) if hasattr(date, "date") else str(date),
+                    entry_price=round(avg_entry, 4),
+                    exit_price=round(fill, 4),
+                    pnl=round(pnl, 2),
+                    pnl_pct=round(pnl_pct, 2),
+                    duration_days=duration,
+                )
+            )
+            cash += proceeds
+            shares = 0.0
+            total_cost = 0.0
+            in_position = False
+            last_buy_price = float("inf")
+
+        equity.append(cash + shares * price)
+
+    if in_position and shares > 0:
+        last_date, last_price = list(prices.items())[-1]
+        fill = last_price * (1 + slippage)
+        proceeds = shares * fill * (1 - fees)
+        avg_entry = total_cost / shares
+        pnl = proceeds - total_cost
+        pnl_pct = (proceeds / total_cost - 1) * 100 if total_cost > 0 else 0.0
+        duration = (last_date - entry_date_first).days if hasattr(last_date - entry_date_first, "days") else 0
+        trades.append(
+            TradeRecord(
+                entry_date=str(entry_date_first.date()) if hasattr(entry_date_first, "date") else str(entry_date_first),
+                exit_date=str(last_date.date()) + " (open)",
+                entry_price=round(avg_entry, 4),
+                exit_price=round(fill, 4),
+                pnl=round(pnl, 2),
+                pnl_pct=round(pnl_pct, 2),
+                duration_days=duration,
+            )
+        )
 
     equity_series = pd.Series(equity, index=prices.index, name="equity")
     returns = equity_series.pct_change().fillna(0)
@@ -107,13 +394,42 @@ class BacktestRunner:
         strategy = strategy_cls(params.strategy_params)
         entries, exits = strategy.generate_signals(data)
 
-        strat_stats = _simulate(prices, entries, exits, params.init_cash, params.fees, params.slippage)
+        if getattr(strategy, "pct_dca_mode", False):
+            strat_stats = _simulate_pct_dca(
+                prices, entries, exits,
+                params.init_cash, params.fees, params.slippage,
+                position_pct=float(strategy.get("position_pct")) / 100.0,
+                dca_drop_pct=float(strategy.get("dca_drop_pct")),
+                annual_contribution=params.annual_contribution,
+                cash_rate=params.cash_rate,
+            )
+        elif getattr(strategy, "dca_mode", False):
+            strat_stats = _simulate_dca(
+                prices, entries, exits,
+                params.init_cash, params.fees, params.slippage,
+                max_adds=int(strategy.get("max_adds")),
+                dca_drop_pct=float(strategy.get("dca_drop_pct")),
+                cash_rate=params.cash_rate,
+            )
+        else:
+            strat_stats = _simulate(
+                prices, entries, exits, params.init_cash, params.fees, params.slippage,
+                cash_rate=params.cash_rate,
+                monthly_contribution=params.annual_contribution / 12,
+                auto_invest_contributions=False,
+                hard_stop_pct=getattr(strategy, "hard_stop_pct", 0.0),
+                consec_stop_limit=int(strategy.get("consec_stop_limit")) if hasattr(strategy, "get") and any(p.name == "consec_stop_limit" for p in strategy.param_specs()) else 0,
+                pause_bars=int(strategy.get("pause_bars")) if hasattr(strategy, "get") and any(p.name == "pause_bars" for p in strategy.param_specs()) else 20,
+            )
 
         benchmark_stats = None
         if params.run_benchmark:
             bh = BuyAndHold()
             b_entries, b_exits = bh.generate_signals(data)
-            benchmark_stats = _simulate(prices, b_entries, b_exits, params.init_cash, params.fees, params.slippage)
+            benchmark_stats = _simulate(
+                prices, b_entries, b_exits, params.init_cash, params.fees, params.slippage,
+                monthly_contribution=params.annual_contribution / 12,
+            )
 
         return BacktestResult(
             params=params,

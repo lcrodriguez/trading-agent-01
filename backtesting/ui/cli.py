@@ -16,7 +16,7 @@ def main():
     """Backtesting CLI — run and analyze trading strategies."""
 
 
-@main.command()
+@main.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 @click.option("--symbol", default="SPY", show_default=True, help="Ticker (e.g. SPY, AAPL, BTC/USDT)")
 @click.option("--strategy", "strategy_name", default="sma_crossover", show_default=True)
 @click.option("--start", default="2010-01-01", show_default=True)
@@ -24,12 +24,36 @@ def main():
 @click.option("--interval", default="1d", show_default=True, type=click.Choice(["1d", "1wk", "1mo"]))
 @click.option("--cash", "init_cash", default=10_000.0, show_default=True, type=float)
 @click.option("--fees", default=0.001, show_default=True, type=float, help="Fee fraction per trade")
-@click.option("--fast-period", default=50, show_default=True, type=int, help="SMA fast period")
-@click.option("--slow-period", default=200, show_default=True, type=int, help="SMA slow period")
 @click.option("--output", default=None, help="Save result as JSON (e.g. outputs/result.json)")
 @click.option("--no-benchmark", is_flag=True, default=False, help="Skip buy-and-hold benchmark")
-def run(symbol, strategy_name, start, end, interval, init_cash, fees, fast_period, slow_period, output, no_benchmark):
-    """Run a backtest and print metrics."""
+@click.option("--trades", is_flag=True, default=False, help="Print individual trade details")
+@click.argument("extra_params", nargs=-1, type=click.UNPROCESSED)
+def run(symbol, strategy_name, start, end, interval, init_cash, fees, output, no_benchmark, trades, extra_params):
+    """Run a backtest and print metrics.
+
+    Pass strategy-specific params as --key value pairs, e.g.:
+      bt run --strategy renko_sma --sma-period 9 --atr-period 14
+      bt run --strategy sma_crossover --fast-period 50 --slow-period 200
+    """
+    # Parse extra --key value pairs into strategy_params dict
+    strategy_params: dict = {}
+    it = iter(extra_params)
+    for token in it:
+        if token.startswith("--"):
+            key = token.lstrip("-").replace("-", "_")
+            try:
+                raw = next(it)
+                # Auto-cast: int → float → str
+                try:
+                    strategy_params[key] = int(raw)
+                except ValueError:
+                    try:
+                        strategy_params[key] = float(raw)
+                    except ValueError:
+                        strategy_params[key] = raw
+            except StopIteration:
+                pass
+
     params = BacktestParams(
         symbol=symbol,
         start=start,
@@ -38,7 +62,7 @@ def run(symbol, strategy_name, start, end, interval, init_cash, fees, fast_perio
         init_cash=init_cash,
         fees=fees,
         strategy_name=strategy_name,
-        strategy_params={"fast_period": fast_period, "slow_period": slow_period},
+        strategy_params=strategy_params,
         run_benchmark=not no_benchmark,
     )
 
@@ -66,9 +90,78 @@ def run(symbol, strategy_name, start, end, interval, init_cash, fees, fast_perio
 
     console.print(table)
 
+    if trades:
+        trade_table = Table(title="Trades", show_lines=True)
+        trade_table.add_column("#", justify="right", style="dim")
+        trade_table.add_column("Entry Date", min_width=12)
+        trade_table.add_column("Exit Date", min_width=14)
+        trade_table.add_column("Entry $", justify="right")
+        trade_table.add_column("Exit $", justify="right")
+        trade_table.add_column("P&L $", justify="right")
+        trade_table.add_column("P&L %", justify="right")
+        trade_table.add_column("Days", justify="right")
+        for i, t in enumerate(result.strategy.trades, 1):
+            pnl_color = "green" if t.pnl >= 0 else "red"
+            trade_table.add_row(
+                str(i),
+                t.entry_date,
+                t.exit_date,
+                f"{t.entry_price:,.4f}",
+                f"{t.exit_price:,.4f}",
+                f"[{pnl_color}]{t.pnl:+,.2f}[/{pnl_color}]",
+                f"[{pnl_color}]{t.pnl_pct:+.2f}%[/{pnl_color}]",
+                str(t.duration_days),
+            )
+        console.print(trade_table)
+
     if output:
         ResultExporter.to_json(result, output)
         console.print(f"[green]Result saved to {output}[/green]")
+
+
+@main.command()
+@click.option("--input", "paths", multiple=True, required=True, help="Saved JSON results to compare (repeat for each)")
+def compare(paths):
+    """Compare multiple saved backtest results side by side.
+
+    Example:
+      bt run --strategy sma_crossover --output outputs/sma.json
+      bt run --strategy renko_sma --output outputs/renko.json
+      bt compare --input outputs/sma.json --input outputs/renko.json
+    """
+    results = [ResultExporter.load_json(p) for p in paths]
+
+    all_keys = list(results[0]["strategy_metrics"].keys())
+
+    title = "Strategy Comparison"
+    table = Table(title=title, show_lines=True)
+    table.add_column("Metric", style="bold")
+    for r in results:
+        label = f"{r['params']['strategy_name']}\n{r['params']['symbol']} {r['params']['start'][:4]}–{r['params']['end'][:4]}"
+        table.add_column(label, justify="right")
+
+    for key in all_keys:
+        row = [key]
+        vals = [r["strategy_metrics"].get(key) for r in results]
+
+        for i, v in enumerate(vals):
+            if v is None:
+                row.append("—")
+                continue
+            cell = str(v)
+            # Highlight best value (green) for numeric metrics
+            if isinstance(v, (int, float)) and len(vals) > 1:
+                numeric = [x for x in vals if isinstance(x, (int, float))]
+                if len(numeric) == len(vals):
+                    # Higher is better for most metrics except drawdown/duration
+                    lower_is_better = "Drawdown" in key or "Duration" in key
+                    best = min(numeric) if lower_is_better else max(numeric)
+                    if v == best:
+                        cell = f"[bold green]{v}[/bold green]"
+            row.append(cell)
+        table.add_row(*row)
+
+    console.print(table)
 
 
 @main.command("list-strategies")
