@@ -102,6 +102,8 @@ def run(symbol, strategy_name, start, end, interval, init_cash, fees, output, no
         trade_table.add_column("P&L $", justify="right")
         trade_table.add_column("P&L %", justify="right")
         trade_table.add_column("Days", justify="right")
+        trade_table.add_column("Entry Reason", min_width=16)
+        trade_table.add_column("Exit Reason", min_width=14)
         from datetime import date as date_type
         trades_list = result.strategy.trades
         for i, t in enumerate(trades_list, 1):
@@ -115,6 +117,8 @@ def run(symbol, strategy_name, start, end, interval, init_cash, fees, output, no
                 f"[{pnl_color}]{t.pnl:+,.2f}[/{pnl_color}]",
                 f"[{pnl_color}]{t.pnl_pct:+.2f}%[/{pnl_color}]",
                 str(t.duration_days),
+                f"[dim]{t.entry_reason}[/dim]" if t.entry_reason else "",
+                f"[dim]{t.exit_reason}[/dim]" if t.exit_reason else "",
             )
             # Show days out of market between this exit and next entry
             if i < len(trades_list):
@@ -127,7 +131,7 @@ def run(symbol, strategy_name, start, end, interval, init_cash, fees, output, no
                     cash_earned_pct = ((1 + cash_rate) ** (gap / 365) - 1) * 100
                     trade_table.add_row(
                         "", f"[dim]↕ {gap}d out[/dim]", "",
-                        "", "", f"[dim]+{cash_earned_pct:.2f}%[/dim]", "[dim]cash[/dim]", "",
+                        "", "", f"[dim]+{cash_earned_pct:.2f}%[/dim]", "[dim]cash[/dim]", "", "", "",
                         end_section=True,
                     )
                 except Exception:

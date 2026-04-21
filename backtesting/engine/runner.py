@@ -21,6 +21,8 @@ class TradeRecord:
     pnl: float
     pnl_pct: float
     duration_days: int
+    entry_reason: str = ""
+    exit_reason: str = ""
 
 
 @dataclass
@@ -54,6 +56,8 @@ def _simulate(
     opens: pd.Series | None = None,
     lows: pd.Series | None = None,
     entry_stops: pd.Series | None = None,
+    entry_reasons: pd.Series | None = None,
+    exit_reasons: pd.Series | None = None,
 ) -> PortfolioStats:
     """Vectorized single-asset portfolio simulation.
 
@@ -69,6 +73,7 @@ def _simulate(
     entry_price = 0.0
     entry_date = None
     active_stop_price = float("nan")
+    active_entry_reason = ""
     trades: list[TradeRecord] = []
     last_month: int | None = None
 
@@ -101,6 +106,7 @@ def _simulate(
             in_position = True
             entry_price = fill
             entry_date = date
+            active_entry_reason = entry_reasons.get(date, "") if entry_reasons is not None else ""
             # Per-entry stop: from entry_stops series, else uniform hard_stop_pct
             if entry_stops is not None and not pd.isna(entry_stops.get(date, float("nan"))):
                 active_stop_price = entry_stops.get(date)
@@ -133,12 +139,15 @@ def _simulate(
                     pnl=round(pnl, 2),
                     pnl_pct=round(pnl_pct, 2),
                     duration_days=duration,
+                    entry_reason=active_entry_reason,
+                    exit_reason="stop_loss",
                 )
             )
             cash = proceeds
             shares = 0.0
             in_position = False
             active_stop_price = float("nan")
+            active_entry_reason = ""
 
         elif in_position and exits.get(date, False):
             proceeds = shares * fill * (1 - fees)
@@ -154,12 +163,15 @@ def _simulate(
                     pnl=round(pnl, 2),
                     pnl_pct=round(pnl_pct, 2),
                     duration_days=duration,
+                    entry_reason=active_entry_reason,
+                    exit_reason=exit_reasons.get(date, "") if exit_reasons is not None else "",
                 )
             )
             cash = proceeds
             shares = 0.0
             in_position = False
             active_stop_price = float("nan")
+            active_entry_reason = ""
 
         equity.append(cash + shares * price)
 
@@ -179,6 +191,8 @@ def _simulate(
                 pnl=round(pnl, 2),
                 pnl_pct=round(pnl_pct, 2),
                 duration_days=duration,
+                entry_reason=active_entry_reason,
+                exit_reason="open",
             )
         )
 
@@ -404,6 +418,8 @@ class BacktestRunner:
         sig = strategy.generate_signals(data)
         entries, exits = sig[0], sig[1]
         entry_stops = sig[2] if len(sig) > 2 else None
+        entry_reasons = sig[3] if len(sig) > 3 else None
+        exit_reasons = sig[4] if len(sig) > 4 else None
         opens = data.df["Open"] if "Open" in data.df.columns else None
         lows = data.df["Low"] if "Low" in data.df.columns else None
 
@@ -434,6 +450,8 @@ class BacktestRunner:
                 opens=opens,
                 lows=lows,
                 entry_stops=entry_stops,
+                entry_reasons=entry_reasons,
+                exit_reasons=exit_reasons,
             )
 
         benchmark_stats = None
