@@ -27,8 +27,9 @@ def main():
 @click.option("--output", default=None, help="Save result as JSON (e.g. outputs/result.json)")
 @click.option("--no-benchmark", is_flag=True, default=False, help="Skip buy-and-hold benchmark")
 @click.option("--trades", is_flag=True, default=False, help="Print individual trade details")
+@click.option("--cash-rate", default=0.04, show_default=True, type=float, help="Annual return on idle cash (e.g. 0.04 = 4%)")
 @click.argument("extra_params", nargs=-1, type=click.UNPROCESSED)
-def run(symbol, strategy_name, start, end, interval, init_cash, fees, output, no_benchmark, trades, extra_params):
+def run(symbol, strategy_name, start, end, interval, init_cash, fees, output, no_benchmark, trades, cash_rate, extra_params):
     """Run a backtest and print metrics.
 
     Pass strategy-specific params as --key value pairs, e.g.:
@@ -64,6 +65,7 @@ def run(symbol, strategy_name, start, end, interval, init_cash, fees, output, no
         strategy_name=strategy_name,
         strategy_params=strategy_params,
         run_benchmark=not no_benchmark,
+        cash_rate=cash_rate,
     )
 
     console.print(f"[bold cyan]Running {strategy_name} on {symbol} ({start} → {end})[/bold cyan]")
@@ -100,7 +102,9 @@ def run(symbol, strategy_name, start, end, interval, init_cash, fees, output, no
         trade_table.add_column("P&L $", justify="right")
         trade_table.add_column("P&L %", justify="right")
         trade_table.add_column("Days", justify="right")
-        for i, t in enumerate(result.strategy.trades, 1):
+        from datetime import date as date_type
+        trades_list = result.strategy.trades
+        for i, t in enumerate(trades_list, 1):
             pnl_color = "green" if t.pnl >= 0 else "red"
             trade_table.add_row(
                 str(i),
@@ -112,6 +116,22 @@ def run(symbol, strategy_name, start, end, interval, init_cash, fees, output, no
                 f"[{pnl_color}]{t.pnl_pct:+.2f}%[/{pnl_color}]",
                 str(t.duration_days),
             )
+            # Show days out of market between this exit and next entry
+            if i < len(trades_list):
+                next_t = trades_list[i]
+                try:
+                    exit_str = t.exit_date.replace(" (open)", "")
+                    d1 = date_type.fromisoformat(exit_str)
+                    d2 = date_type.fromisoformat(next_t.entry_date)
+                    gap = (d2 - d1).days
+                    cash_earned_pct = ((1 + cash_rate) ** (gap / 365) - 1) * 100
+                    trade_table.add_row(
+                        "", f"[dim]↕ {gap}d out[/dim]", "",
+                        "", "", f"[dim]+{cash_earned_pct:.2f}%[/dim]", "[dim]cash[/dim]", "",
+                        end_section=True,
+                    )
+                except Exception:
+                    pass
         console.print(trade_table)
 
     if output:

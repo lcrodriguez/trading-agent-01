@@ -12,7 +12,7 @@ class BacktestParams(BaseModel):
     strategy_name: str = "sma_crossover"
     strategy_params: dict = {}
     run_benchmark: bool = True
-    cash_rate: float = 0.0  # annual return on idle cash (e.g. 0.025 for 2.5% bonds)
+    cash_rate: float = 0.04  # annual return on idle cash (4% default — HYSA/T-bill proxy)
     annual_contribution: float = 0.0  # cash injected at the start of each calendar year
 
     @model_validator(mode="after")
