@@ -30,6 +30,7 @@ class HASMA(BaseStrategy):
             StrategyParam("filter_sma_period", "int", 50, "SMA period for depth filter and golden cross", min_val=5, max_val=500),
             StrategyParam("filter_pct", "float", 3.0, "Min % price must be below filter SMA to enter (reversal)", min_val=0.0, max_val=30.0),
             StrategyParam("fast_sma_period", "int", 9, "Fast SMA period for golden cross re-entry", min_val=2, max_val=100),
+            StrategyParam("confirm_bars", "int", 1, "Green HA bars required before entry (1=first flip, 2=second confirmed)", min_val=1, max_val=5),
         ]
 
     def generate_signals(self, data: DataResult) -> tuple[pd.Series, pd.Series]:
@@ -39,6 +40,7 @@ class HASMA(BaseStrategy):
         filter_sma_period = int(self.get("filter_sma_period"))
         filter_pct = float(self.get("filter_pct")) / 100.0
         fast_sma_period = int(self.get("fast_sma_period"))
+        confirm_bars = int(self.get("confirm_bars"))
 
         ha = _compute_ha(df)
         sma21 = _ha_sma(ha["close"], sma_period)
@@ -47,10 +49,13 @@ class HASMA(BaseStrategy):
         sma9 = df["Close"].rolling(fast_sma_period, min_periods=1).mean()
 
         color = ha["color"]
-        turns_green = (color == "green") & (color.shift(1) == "red")
 
-        # Entry A: HA reversal — flip below SMA21 AND price at least filter_pct% below SMA50
-        ha_entry = turns_green & (ha["close"] < sma21) & (df["Close"] < sma50 * (1 - filter_pct))
+        # Nth consecutive green bar after a red run (confirm_bars=1 → first flip, =2 → second green)
+        green_streak = pd.concat([color.shift(i) for i in range(confirm_bars)], axis=1)
+        reversal = (green_streak == "green").all(axis=1) & (color.shift(confirm_bars) == "red")
+
+        # Entry A: HA reversal — Nth green bar below SMA21 AND price at least filter_pct% below SMA50
+        ha_entry = reversal & (ha["close"] < sma21) & (df["Close"] < sma50 * (1 - filter_pct))
 
         # Entry B: SMA9 crosses above SMA50 (fast golden cross — momentum recovery re-entry)
         golden_cross = (sma9 > sma50) & (sma9.shift(1) <= sma50.shift(1))
