@@ -51,8 +51,8 @@ def _simulate(
     monthly_contribution: float = 0.0,
     auto_invest_contributions: bool = True,
     hard_stop_pct: float = 0.0,
-    consec_stop_limit: int = 0,
-    pause_bars: int = 20,
+    opens: pd.Series | None = None,
+    lows: pd.Series | None = None,
 ) -> PortfolioStats:
     """Vectorized single-asset portfolio simulation.
 
@@ -69,8 +69,6 @@ def _simulate(
     entry_date = None
     trades: list[TradeRecord] = []
     last_month: int | None = None
-    consec_stops = 0
-    pause_remaining = 0
 
     for date, price in prices.items():
         if monthly_contribution > 0 and hasattr(date, "month"):
@@ -93,20 +91,28 @@ def _simulate(
         if not in_position and daily_cash_rate:
             cash *= (1 + daily_cash_rate)
 
-        if pause_remaining > 0:
-            pause_remaining -= 1
-
         fill = price * (1 + slippage)
 
-        if not in_position and pause_remaining == 0 and entries.get(date, False):
+        if not in_position and entries.get(date, False):
             shares = (cash / fill) * (1 - fees)
             cash = 0.0
             in_position = True
             entry_price = fill
             entry_date = date
 
-        elif in_position and hard_stop_pct > 0 and price < entry_price * (1 - hard_stop_pct):
-            fill = price * (1 + slippage)
+        elif in_position and hard_stop_pct > 0 and (
+            lows is not None and lows.get(date, price) < entry_price * (1 - hard_stop_pct)
+            or lows is None and price < entry_price * (1 - hard_stop_pct)
+        ):
+            stop_price = entry_price * (1 - hard_stop_pct)
+            if opens is not None:
+                open_price = opens.get(date, price)
+                # Gap-down: opened below stop — fill at open (can't do better)
+                # Intraday hit: opened above stop — fill at stop price
+                fill_price = open_price if open_price < stop_price else stop_price
+            else:
+                fill_price = price
+            fill = fill_price * (1 + slippage)
             proceeds = shares * fill * (1 - fees)
             pnl = proceeds - (shares * entry_price)
             pnl_pct = (fill / entry_price - 1) * 100
@@ -125,15 +131,6 @@ def _simulate(
             cash = proceeds
             shares = 0.0
             in_position = False
-            if abs(pnl_pct) > 3.0:
-                # Large gap-down: market is in panic, sit out immediately
-                pause_remaining = pause_bars
-                consec_stops = 0
-            elif consec_stop_limit > 0:
-                consec_stops += 1
-                if consec_stops >= consec_stop_limit:
-                    pause_remaining = pause_bars
-                    consec_stops = 0
 
         elif in_position and exits.get(date, False):
             proceeds = shares * fill * (1 - fees)
@@ -154,7 +151,6 @@ def _simulate(
             cash = proceeds
             shares = 0.0
             in_position = False
-            consec_stops = 0
 
         equity.append(cash + shares * price)
 
@@ -397,6 +393,8 @@ class BacktestRunner:
         strategy_cls = get_strategy(params.strategy_name)
         strategy = strategy_cls(params.strategy_params)
         entries, exits = strategy.generate_signals(data)
+        opens = data.df["Open"] if "Open" in data.df.columns else None
+        lows = data.df["Low"] if "Low" in data.df.columns else None
 
         if getattr(strategy, "pct_dca_mode", False):
             strat_stats = _simulate_pct_dca(
@@ -422,8 +420,8 @@ class BacktestRunner:
                 monthly_contribution=params.annual_contribution / 12,
                 auto_invest_contributions=False,
                 hard_stop_pct=getattr(strategy, "hard_stop_pct", 0.0),
-                consec_stop_limit=int(strategy.get("consec_stop_limit")) if hasattr(strategy, "get") and any(p.name == "consec_stop_limit" for p in strategy.param_specs()) else 0,
-                pause_bars=int(strategy.get("pause_bars")) if hasattr(strategy, "get") and any(p.name == "pause_bars" for p in strategy.param_specs()) else 20,
+                opens=opens,
+                lows=lows,
             )
 
         benchmark_stats = None
