@@ -125,7 +125,11 @@ def _simulate(
             cash = proceeds
             shares = 0.0
             in_position = False
-            if consec_stop_limit > 0 and abs(pnl_pct) <= 3.0:
+            if abs(pnl_pct) > 3.0:
+                # Large gap-down: market is in panic, sit out immediately
+                pause_remaining = pause_bars
+                consec_stops = 0
+            elif consec_stop_limit > 0:
                 consec_stops += 1
                 if consec_stops >= consec_stop_limit:
                     pause_remaining = pause_bars
